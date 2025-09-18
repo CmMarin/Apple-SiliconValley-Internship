@@ -1,0 +1,34 @@
+{
+  "name": "electron-task-sync",
+  "version": "1.0.0",
+  "description": "An Electron application to convert unstructured bilingual natural language input into structured tasks and sync them with Google Calendar.",
+  "main": "dist/main.js",
+  "scripts": {
+    "start": "npm run build && electron .",
+    "build": "tsc",
+    "dev": "npm run build && electron . --dev"
+  },
+  "dependencies": {
+    "electron": "^25.0.0",
+    "mongodb": "^5.0.0",
+    "googleapis": "^39.2.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "ts-loader": "^9.0.0",
+    "electron-builder": "^24.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/electron-task-sync.git"
+  },
+  "keywords": [
+    "electron",
+    "tasks",
+    "google-calendar",
+    "nlp",
+    "bilingual"
+  ],
+  "author": "Your Name",
+  "license": "MIT"
+}

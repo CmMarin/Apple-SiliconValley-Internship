@@ -1,0 +1,21 @@
+[tool]
+name = "electron-task-sync-backend"
+version = "0.1.0"
+description = "Backend for converting unstructured bilingual natural language input into structured tasks and syncing with Google Calendar."
+authors = ["Your Name <youremail@example.com>"]
+license = "MIT"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[dependencies]
+fastapi = "^0.75.0"
+uvicorn = "^0.17.0"
+pymongo = "^3.12.0"
+google-api-python-client = "^2.31.0"
+transformers = "^4.21.1"
+torch = "^1.10.0"  # or the appropriate version for your system
+
+[tool.poetry.scripts]
+start = "app.main:app"

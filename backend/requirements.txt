@@ -1,0 +1,12 @@
+Flask==2.2.3
+fastapi==0.95.0
+uvicorn==0.22.0
+pymongo==4.3.3
+google-api-python-client==2.70.0
+transformers==4.30.0
+# PyTorch pinned to installed/verified version for Python 3.11 on Windows
+torch==2.8.0
+sentence-transformers==2.2.2
+python-dotenv==1.0.0
+pydantic==1.10.7
+huggingface_hub==0.14.1
