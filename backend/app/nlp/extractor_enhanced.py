@@ -185,7 +185,6 @@ def normalize_date(date_str: str) -> str:
     # If we can't normalize, return the original string
     return date_str
 
-
 def extract_tasks(input_text: str) -> List[Dict[str, str]]:
     """
     Enhanced task extraction with improved time, date, and deadline detection

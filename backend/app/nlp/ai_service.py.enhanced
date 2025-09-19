@@ -1,0 +1,619 @@
+from typing import Dict, Any, List, Optional, Union
+import threading
+import time
+import logging
+import re
+import json
+from enum import Enum
+from datetime import datetime, timedelta
+
+# Keep transformers imports
+from transformers import pipeline
+from app.nlp.extractor import extract_tasks
+
+# Setup logger
+logger = logging.getLogger(__name__)
+
+class ModelState(str, Enum):
+    NOT_LOADED = "not_loaded"
+    LOADING = "loading"
+    READY = "ready"
+    ERROR = "error"
+
+class AIModelService:
+    """
+    Enhanced AI service to manage model loading, inference with status tracking,
+    and improved intent recognition including greeting detection and date handling.
+    """
+    
+    def __init__(self):
+        self._model = None
+        self._state = ModelState.NOT_LOADED
+        self._error = None
+        self._lock = threading.Lock()
+        self._load_thread = None
+        self._model_path = "google/flan-t5-small"  # Default model
+        self._last_status_check = None
+        self._last_input = None
+        
+        # New: Add common greetings in multiple languages
+        self.greetings = {
+            "english": [
+                "hi", "hello", "hey", "good morning", "good afternoon", 
+                "good evening", "howdy", "hi there", "hello there",
+                "what's up", "sup", "yo", "greetings"
+            ],
+            "romanian": [
+                "salut", "bună", "buna", "bună ziua", "buna ziua", 
+                "bună dimineața", "buna dimineata", "bună seara", "buna seara",
+                "servus", "noroc", "ce faci", "ce mai faci", "neata"
+            ]
+        }
+        
+        # New: Add common relative date mappings
+        self.relative_dates = {
+            "today": 0,
+            "tomorrow": 1,
+            "day after tomorrow": 2,
+            "next week": 7,
+            "azi": 0,
+            "astăzi": 0,
+            "mâine": 1,
+            "maine": 1,
+            "poimâine": 2,
+            "poimaine": 2,
+            "săptămâna viitoare": 7,
+            "saptamana viitoare": 7
+        }
+        
+        # New: Day of week mappings
+        self.days_of_week = {
+            "monday": 0, "tuesday": 1, "wednesday": 2, 
+            "thursday": 3, "friday": 4, "saturday": 5, "sunday": 6,
+            "luni": 0, "marți": 1, "marti": 1, "miercuri": 2, 
+            "joi": 3, "vineri": 4, "sâmbătă": 5, "sambata": 5, 
+            "duminică": 6, "duminica": 6
+        }
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Get the current status of the AI model"""
+        # Track when we last logged a status check to reduce log spam
+        old_state = self._state
+        
+        # Store status result
+        status = {
+            "state": self._state,
+            "model": self._model_path if self._model else None,
+            "error": str(self._error) if self._error else None,
+            "loading_started": self._load_thread is not None and self._load_thread.is_alive()
+        }
+        
+        # Only log status checks if it's been more than 30 seconds since last log
+        # or if there's an error or state change
+        current_time = time.time()
+        should_log = (
+            self._last_status_check is None or
+            (current_time - self._last_status_check) > 30 or
+            self._state == ModelState.ERROR or
+            old_state != self._state
+        )
+        
+        if should_log:
+            logger.debug(f"Model status check: {status}")
+            self._last_status_check = current_time
+            
+        return status
+    
+    def start_loading(self) -> None:
+        """
+        Begin loading the model in a background thread if not already loading
+        """
+        with self._lock:
+            if self._state == ModelState.LOADING:
+                # Already loading
+                return
+                
+            if self._state == ModelState.READY:
+                # Already loaded
+                return
+                
+            # Start loading in background thread
+            self._state = ModelState.LOADING
+            self._error = None
+            self._load_thread = threading.Thread(target=self._load_model)
+            self._load_thread.daemon = True
+            self._load_thread.start()
+    
+    def _load_model(self) -> None:
+        """Internal method to load the model"""
+        try:
+            logger.info(f"Loading model {self._model_path}...")
+            start_time = time.time()
+            
+            # Load the model
+            self._model = pipeline(
+                "text2text-generation",
+                model=self._model_path,
+                tokenizer=self._model_path,
+                device=-1  # Use CPU
+            )
+            
+            # Update state
+            with self._lock:
+                self._state = ModelState.READY
+                
+            elapsed = time.time() - start_time
+            logger.info(f"Model loaded successfully in {elapsed:.2f} seconds")
+            
+        except Exception as e:
+            # Handle errors
+            logger.error(f"Error loading model: {e}")
+            with self._lock:
+                self._state = ModelState.ERROR
+                self._error = e
+
+    def _is_greeting(self, text: str) -> bool:
+        """
+        Improved greeting detection by checking against common greetings
+        in multiple languages and recognizing greeting patterns.
+        """
+        text = text.lower().strip()
+        
+        # Check against our greeting lists
+        for lang, greetings in self.greetings.items():
+            for greeting in greetings:
+                if greeting in text or text.startswith(greeting):
+                    return True
+        
+        # Check for greeting patterns (e.g., "hi [name]", "hello to you")
+        greeting_patterns = [
+            r"^(?:hi|hey|hello|salut)\s+\w+",  # Hi John
+            r"^(?:good)\s+(?:morning|afternoon|evening|day)",  # Good morning
+            r"(?:greetings|salutations)",  # Formal greetings
+            r"^(?:how are you|how are you doing|how's it going|ce mai faci|cum esti)",  # Common greeting questions
+        ]
+        
+        for pattern in greeting_patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                return True
+                
+        return False
+
+    def _normalize_date(self, date_text: str) -> str:
+        """
+        Convert relative dates to absolute dates.
+        For example, 'tomorrow' becomes '2023-09-20' (if today is 2023-09-19).
+        Also handles days of the week like 'next monday'.
+        """
+        if not date_text:
+            return date_text
+            
+        # Convert to lowercase for better matching
+        date_text = date_text.lower().strip()
+        
+        # Handle direct relative date mappings
+        if date_text in self.relative_dates:
+            days_to_add = self.relative_dates[date_text]
+            return (datetime.now() + timedelta(days=days_to_add)).strftime("%Y-%m-%d")
+        
+        # Handle "next [day of week]"
+        next_day_match = re.match(r"next\s+(\w+)", date_text)
+        if next_day_match:
+            day_name = next_day_match.group(1).lower()
+            if day_name in self.days_of_week:
+                # Calculate days until next occurrence of this day
+                today = datetime.now().weekday()
+                day_index = self.days_of_week[day_name]
+                days_until = (day_index - today) % 7
+                if days_until == 0:  # If today is the day, go to next week
+                    days_until = 7
+                return (datetime.now() + timedelta(days=days_until)).strftime("%Y-%m-%d")
+        
+        # Handle "this [day of week]"
+        this_day_match = re.match(r"this\s+(\w+)", date_text)
+        if this_day_match:
+            day_name = this_day_match.group(1).lower()
+            if day_name in self.days_of_week:
+                # Calculate days until this occurrence of the day
+                today = datetime.now().weekday()
+                day_index = self.days_of_week[day_name]
+                days_until = (day_index - today) % 7
+                # If the day has passed this week, it refers to next week
+                if days_until == 0 and day_index != today:  
+                    days_until = 7
+                return (datetime.now() + timedelta(days=days_until)).strftime("%Y-%m-%d")
+        
+        # Handle single day of week (e.g., "Monday", "vineri")
+        if date_text in self.days_of_week:
+            today = datetime.now().weekday()
+            day_index = self.days_of_week[date_text]
+            days_until = (day_index - today) % 7
+            # If today is mentioned day and it's already past working hours, go to next week
+            if days_until == 0 and datetime.now().hour >= 17:
+                days_until = 7
+            return (datetime.now() + timedelta(days=days_until)).strftime("%Y-%m-%d")
+        
+        # Return the original if no match
+        return date_text
+    
+    def process_text(self, text: str, options: Dict[str, Any] = None) -> Dict[str, Any]:
+        """
+        Process text input with enhanced intent recognition and fallback mechanisms
+        
+        Args:
+            text: The input text to process
+            options: Processing options (lang, forceJson, etc.)
+            
+        Returns:
+            Dictionary with processing results and metadata
+        """
+        options = options or {}
+        force_json = options.get("forceJson", True)
+        
+        # Store the input text for potential fallback
+        self._last_input = text
+        
+        # Check if text is just a greeting
+        if self._is_greeting(text) and len(text.split()) <= 3:
+            # If it's just a greeting with no task content, return empty tasks
+            logger.info("Detected greeting with no task content")
+            return {
+                "tasks": [],
+                "method": "greeting_detection",
+                "model_state": self._state,
+                "message": "Detected greeting with no tasks"
+            }
+        
+        # If model not ready, use fallback extractor
+        if self._state != ModelState.READY:
+            # Use regex-based extractor as fallback
+            logger.info("Model not ready, using fallback extractor")
+            tasks = extract_tasks(text)
+            # Process the extracted tasks to normalize dates
+            normalized_tasks = self._normalize_task_dates(tasks)
+            return {
+                "tasks": normalized_tasks,
+                "method": "regex_fallback",
+                "model_state": self._state,
+                "message": "Using regex fallback because AI model is not ready"
+            }
+        
+        # Try AI model processing
+        try:
+            # Build the prompt for task extraction
+            prompt = self._build_prompt(text)
+            
+            # Generate with model - only use max_new_tokens (not max_length)
+            output = self._model(prompt, max_new_tokens=256, temperature=0.1, do_sample=False)
+            content = output[0]["generated_text"] if isinstance(output, list) else str(output)
+            logger.debug(f"Model generated text: {content}")
+            
+            # Parse and normalize the results
+            parsed_tasks = self._parse_model_output(content, force_json)
+            
+            # If AI model returned no tasks, fall back to regex extractor
+            if not parsed_tasks and not self._is_greeting(text):
+                logger.warning("AI model returned no tasks, trying fallback extraction")
+                tasks = extract_tasks(text)
+                
+                # Only use fallback if it found something
+                if tasks:
+                    normalized_tasks = self._normalize_task_dates(tasks)
+                    return {
+                        "tasks": normalized_tasks,
+                        "method": "regex_fallback_after_ai_empty",
+                        "model_state": self._state,
+                        "message": "Used regex fallback after AI model returned no tasks"
+                    }
+            
+            # Normalize any dates in the parsed tasks
+            normalized_tasks = self._normalize_task_dates(parsed_tasks)
+            
+            return {
+                "tasks": normalized_tasks,
+                "method": "ai_model",
+                "model_state": self._state,
+                "message": "Successfully processed with AI model"
+            }
+        except Exception as e:
+            # If AI processing fails, fall back to regex extractor
+            logger.error(f"Error during AI processing: {e}")
+            tasks = extract_tasks(text)
+            normalized_tasks = self._normalize_task_dates(tasks)
+            
+            return {
+                "tasks": normalized_tasks,
+                "method": "regex_fallback_after_error",
+                "model_state": self._state,
+                "error": str(e),
+                "message": "Used regex fallback after AI model error"
+            }
+    
+    def _normalize_task_dates(self, tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Process extracted tasks to normalize any relative dates.
+        """
+        normalized_tasks = []
+        for task in tasks:
+            # Create a copy of the task to avoid modifying the original
+            normalized_task = task.copy()
+            
+            # Normalize the deadline field if it exists
+            if task.get("deadline"):
+                normalized_task["deadline"] = self._normalize_date(task["deadline"])
+                
+            # Handle special case where time field contains a relative date
+            if task.get("time") and isinstance(task["time"], str) and task["time"].lower() in self.relative_dates:
+                normalized_task["deadline"] = self._normalize_date(task["time"])
+                normalized_task["time"] = None
+                
+            normalized_tasks.append(normalized_task)
+            
+        return normalized_tasks
+    
+    def _build_prompt(self, text: str) -> str:
+        """
+        Build an improved prompt for task extraction with better instructions
+        for handling greetings and dates.
+        """
+        # Get the current date for reference
+        current_date = datetime.now().strftime("%Y-%m-%d")
+        
+        return (
+            f"You are an expert task extraction engine. Today is {current_date}. "
+            "Read the INPUT and produce a JSON array of tasks.\n"
+            "Rules:\n"
+            "- The language may be Romanian or English. You must understand both.\n"
+            "- Output ONLY valid JSON (no markdown, no explanation).\n"
+            "- Each item has keys exactly: task, time, category, deadline.\n"
+            "- Use null for unknown fields.\n"
+            "- Ignore greetings, filler, random characters, or single letters.\n"
+            "- If the input is just a greeting with no tasks, return [].\n"
+            "- Convert relative dates like 'tomorrow' to specific dates.\n"
+            "- When the word 'tomorrow' appears, use the date for tomorrow.\n"
+            "- For days of the week (Monday, Tuesday, etc.), use the next occurrence.\n"
+            "- Do not split words into letters.\n"
+            "- If there are no tasks, return [].\n"
+            "\nCategories should be one of: Work, Personal, Family, Health, Shopping, Study, Finance, Travel, Home, Other\n"
+            "\nExamples:\n"
+            "English example: \"I need to buy milk at 5pm\"\n"
+            "JSON: [{\"task\":\"buy milk\",\"time\":\"5pm\",\"category\":\"Shopping\",\"deadline\":null}]\n"
+            "\nRomanian example: \"trebuie sa merg maine la piata\"\n"
+            f"JSON: [{{'task':'merg la piata','time':null,'category':'Shopping','deadline':'{self._normalize_date('maine')}'}}]\n"
+            "\nRomanian example: \"du copilul la scoala dimineata\"\n"
+            "JSON: [{\"task\":\"du copilul la scoala\",\"time\":\"dimineata\",\"category\":\"Family\",\"deadline\":null}]\n"
+            "\nRomanian example: \"plata facturi pana vineri\"\n"
+            f"JSON: [{{'task':'plata facturi','time':null,'category':'Finance','deadline':'{self._normalize_date('vineri')}'}}]\n"
+            "\nEnglish example: \"Hello, how are you?\"\n"
+            "JSON: []\n"
+            f"\nINPUT: {text}\n\n"
+            "JSON:"
+        )
+    
+    def _parse_model_output(self, output: str, force_json: bool = True) -> List[Dict[str, Any]]:
+        """Parse and normalize model output"""
+        # Try to extract JSON from the output
+        # Look for array pattern first
+        json_pattern = r"(\[.*?\])"
+        try:
+            # First attempt: try to find and parse JSON array
+            match = re.search(json_pattern, output, re.DOTALL)
+            if match:
+                try:
+                    data = json.loads(match.group(1))
+                    return self._normalize_tasks(data)
+                except json.JSONDecodeError:
+                    logger.warning("Found array pattern but couldn't parse as JSON")
+                
+            # Second attempt: try parsing the whole output as JSON
+            try:
+                data = json.loads(output)
+                if isinstance(data, list):
+                    return self._normalize_tasks(data)
+            except json.JSONDecodeError:
+                logger.warning("Couldn't parse whole output as JSON")
+                
+            # Third attempt: if JSON parsing failed, try fixing common issues
+            cleaned_output = re.sub(r"```json|```|\n", "", output).strip()
+            if cleaned_output.startswith("[") and cleaned_output.endswith("]"):
+                try:
+                    # Replace single quotes with double quotes
+                    cleaned_output = cleaned_output.replace("'", '"')
+                    # Remove trailing commas
+                    cleaned_output = re.sub(r',(\s*[\]}])', r'\1', cleaned_output)
+                    
+                    data = json.loads(cleaned_output)
+                    return self._normalize_tasks(data)
+                except json.JSONDecodeError:
+                    logger.warning("Couldn't parse cleaned output as JSON")
+                
+        except Exception as e:
+            logger.warning(f"Failed to parse JSON from model output: {e}")
+            
+            # Try more aggressive extraction - look for anything that could be a JSON array
+            try:
+                # Find the first [ and last ] in the string
+                start = output.find("[")
+                end = output.rfind("]") + 1
+                
+                if start >= 0 and end > start:
+                    potential_json = output[start:end]
+                    # Replace single quotes with double quotes
+                    potential_json = potential_json.replace("'", '"')
+                    # Remove trailing commas
+                    potential_json = re.sub(r',(\s*[\]}])', r'\1', potential_json)
+                    
+                    data = json.loads(potential_json)
+                    return self._normalize_tasks(data)
+            except (json.JSONDecodeError, IndexError) as e:
+                logger.warning(f"Failed aggressive JSON extraction: {e}")
+                
+        # If all parsing attempts fail and force_json is True, use fallback extractor
+        if force_json:
+            logger.warning("All JSON parsing attempts failed, using regex fallback")
+            return extract_tasks(output)
+            
+        return []
+        
+    def _normalize_tasks(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Normalize task data for consistent output with improved category detection"""
+        tasks = []
+        
+        if not isinstance(data, list):
+            return tasks
+            
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+                
+            task_text = str(item.get("task", "")).strip()
+            
+            # Skip if task is empty or too short
+            if not task_text or len(task_text) < 3:
+                continue
+                
+            # Skip if task is a single letter or common greeting
+            if re.fullmatch(r"[A-Za-z]", task_text) or self._is_greeting(task_text):
+                continue
+                
+            # Detect and fix corrupted task text that might contain JSON or be too long
+            if len(task_text) > 100 or task_text.count(':') > 3 or task_text.count('"') > 3:
+                logger.warning(f"Detected potentially corrupted task text: {task_text[:50]}...")
+                
+                # If it looks like it contains JSON, try to extract the actual task
+                if '[' in task_text and ']' in task_text or '{' in task_text and '}' in task_text:
+                    try:
+                        # Try to find the actual task content if it's embedded in JSON
+                        match = re.search(r'"task"\s*:\s*"([^"]+)"', task_text)
+                        if match:
+                            clean_text = match.group(1).strip()
+                            logger.info(f"Extracted clean task from corrupted text: {clean_text}")
+                            task_text = clean_text
+                        else:
+                            # Just take the first 50 chars if it's too long
+                            task_text = task_text[:50].strip() + "..."
+                    except Exception as e:
+                        logger.warning(f"Failed to clean corrupted task text: {e}")
+                        task_text = task_text[:50].strip() + "..."
+                else:
+                    # Just truncate if it's very long but not JSON
+                    task_text = task_text[:50].strip() + "..."
+                
+            # Normalize categories
+            category = item.get("category")
+            if isinstance(category, str) and category.strip():
+                # Map category to standard categories
+                category = category.strip().lower()
+                if category in {"work", "job", "business", "office", "munca", "serviciu", "birou", "profesional", "meeting", "întâlnire"}:
+                    category = "Work"
+                elif category in {"personal", "private", "individual", "propriu"}:
+                    category = "Personal"
+                elif category in {"family", "familie", "kids", "copii", "parinti", "parents", "children", "child", "copil"}:
+                    category = "Family"
+                elif category in {"health", "sanatate", "medical", "doctor", "fitness", "gym", "sport", "exercise", "workout"}:
+                    category = "Health"
+                elif category in {"shopping", "cumparaturi", "store", "magazin", "buy", "purchase", "grocery", "groceries", "food"}:
+                    category = "Shopping"
+                elif category in {"study", "studiu", "learn", "education", "school", "scoala", "homework", "teme", "course", "class"}:
+                    category = "Study"
+                elif category in {"finance", "financial", "money", "banking", "bills", "facturi", "plati", "payments", "bank"}:
+                    category = "Finance"
+                elif category in {"travel", "vacation", "trip", "journey", "calatorii", "vacanta", "excursie", "tour"}:
+                    category = "Travel"
+                elif category in {"home", "house", "casa", "acasa", "household", "cleaning", "curatenie", "apartment"}:
+                    category = "Home"
+                else:
+                    category = "Other"
+            else:
+                # Try to infer category from task text
+                category = self._infer_category_from_text(task_text)
+                
+            # Normalize date values
+            deadline = item.get("deadline")
+            if deadline:
+                deadline = self._normalize_date(str(deadline))
+                
+            # Add the normalized task
+            tasks.append({
+                "task": task_text,
+                "time": item.get("time") or None,
+                "category": category,
+                "deadline": deadline
+            })
+        
+        return tasks
+        
+    def _infer_category_from_text(self, text: str) -> str:
+        """
+        Infer the category of a task based on its text content.
+        This is more comprehensive than the previous implementation.
+        """
+        # Convert to lowercase for case-insensitive matching
+        text_lower = text.lower()
+        
+        # Work related keywords
+        if any(kw in text_lower for kw in [
+            "work", "meeting", "call", "project", "deadline", "presentation", "client", 
+            "email", "report", "document", "office", "boss", "colleague", "conference",
+            "muncă", "întâlnire", "proiect", "prezentare", "birou", "șef", "coleg"
+        ]):
+            return "Work"
+            
+        # Family related keywords
+        if any(kw in text_lower for kw in [
+            "family", "kid", "child", "parent", "mom", "dad", "mother", "father",
+            "familie", "copil", "părinte", "mama", "tata", "mamă", "tatăl", "soț", "soție"
+        ]):
+            return "Family"
+            
+        # Home related keywords
+        if any(kw in text_lower for kw in [
+            "house", "home", "clean", "cook", "dinner", "lunch", "breakfast", "laundry", "dishes",
+            "casă", "acasă", "curăț", "gătit", "cină", "prânz", "mic dejun", "rufe", "vase"
+        ]):
+            return "Home"
+            
+        # Shopping related keywords
+        if any(kw in text_lower for kw in [
+            "buy", "purchase", "shop", "store", "grocery", "groceries", "market", "mall",
+            "cumpără", "achiziție", "magazin", "cumpărături", "piață", "mall", "supermarket"
+        ]):
+            return "Shopping"
+            
+        # Health related keywords
+        if any(kw in text_lower for kw in [
+            "doctor", "appointment", "medicine", "prescription", "health", "medical",
+            "workout", "exercise", "gym", "fitness", "dentist", "hospital",
+            "medic", "programare", "medicament", "sănătate", "antrenament", "exercițiu", "sală", "spital"
+        ]):
+            return "Health"
+            
+        # Finance related keywords
+        if any(kw in text_lower for kw in [
+            "pay", "bill", "invoice", "money", "bank", "account", "tax", "payment",
+            "plată", "factură", "bani", "bancă", "cont", "taxă", "impozit"
+        ]):
+            return "Finance"
+            
+        # Travel related keywords
+        if any(kw in text_lower for kw in [
+            "trip", "travel", "flight", "airport", "hotel", "vacation", "booking",
+            "călătorie", "zbor", "aeroport", "hotel", "vacanță", "rezervare"
+        ]):
+            return "Travel"
+            
+        # Study related keywords
+        if any(kw in text_lower for kw in [
+            "study", "learn", "course", "class", "lecture", "exam", "test", "homework", 
+            "studiu", "învăța", "curs", "clasă", "lecție", "examen", "test", "temă"
+        ]):
+            return "Study"
+            
+        # Default to Personal if nothing else matches
+        return "Personal"
+
+# Create a global instance of the service
+model_service = AIModelService()
+
+# Start loading the model when the module is imported
+model_service.start_loading()

@@ -6,7 +6,7 @@ import csv
 import io
 from datetime import datetime
 from app.nlp.extractor import extract_tasks
-from app.nlp.model_utils import parse_with_transformer
+from app.nlp.ai_service import model_service
 from app.google.calendar import list_events as gcal_list, create_event as gcal_create
 
 router = APIRouter()
@@ -16,6 +16,19 @@ class Task(BaseModel):
     time: Optional[str] = None
     category: Optional[str] = None
     deadline: Optional[str] = None
+
+class ModelStatus(BaseModel):
+    state: str
+    model: Optional[str] = None
+    error: Optional[str] = None
+    loading_started: bool
+
+class ParseResponse(BaseModel):
+    tasks: List[Task]
+    method: str
+    model_state: str
+    message: Optional[str] = None
+    error: Optional[str] = None
 
 @router.post("/tasks/", response_model=List[Task])
 async def create_tasks(tasks: List[Task]):
@@ -32,22 +45,38 @@ async def delete_task(task_id: int):
     # Here you would typically delete a task from the database
     return {"message": "Task deleted successfully"}
 
+@router.get("/model/status", response_model=ModelStatus)
+async def get_model_status():
+    """Get the current status of the AI model"""
+    return model_service.get_status()
+
+@router.post("/model/load", response_model=ModelStatus)
+async def load_model():
+    """Trigger model loading if not already started"""
+    model_service.start_loading()
+    return model_service.get_status()
 
 class ParseRequest(BaseModel):
     text: str
+    lang: Optional[str] = "ro"
+    forceJson: Optional[bool] = True
 
-@router.post("/parse", response_model=List[Task])
+@router.post("/parse", response_model=ParseResponse)
 async def parse_text(req: ParseRequest):
     try:
-        # Try transformer-based parse first, fall back to regex extractor
-        try:
-            tasks = parse_with_transformer(req.text)
-        except Exception:
-            tasks = extract_tasks(req.text)
+        # Process the text with our AI service (handles fallbacks automatically)
+        result = model_service.process_text(
+            req.text, 
+            options={
+                "lang": req.lang,
+                "forceJson": req.forceJson
+            }
+        )
+        
         # Final filtering and deduplication
         clean = []
         seen = set()
-        for t in tasks:
+        for t in result["tasks"]:
             task_text = (t.get("task") or "").strip()
             if not task_text or len(task_text) < 3:
                 continue
@@ -62,8 +91,11 @@ async def parse_text(req: ParseRequest):
                 "category": t.get("category") or None,
                 "deadline": t.get("deadline") or None,
             })
-        # Map to Task models (handling None for optional fields)
-        return [Task(**t) for t in clean]
+        
+        # Update the tasks in the result
+        result["tasks"] = [Task(**t) for t in clean]
+        
+        return ParseResponse(**result)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

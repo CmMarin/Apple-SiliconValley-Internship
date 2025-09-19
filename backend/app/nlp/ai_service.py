@@ -1,0 +1,408 @@
+from typing import Dict, Any, List, Optional, Union
+import threading
+import time
+import logging
+import re
+import json
+from enum import Enum
+from datetime import datetime, timedelta
+
+# Keep transformers imports
+from transformers import pipeline
+from app.nlp.extractor import extract_tasks, normalize_date, is_greeting
+
+# Setup logger
+logger = logging.getLogger(__name__)
+
+class ModelState(str, Enum):
+    NOT_LOADED = "not_loaded"
+    LOADING = "loading"
+    READY = "ready"
+    ERROR = "error"
+
+class AIModelService:
+    """
+    A service to manage AI model loading and inference with status tracking
+    and fallback mechanisms.
+    """
+    
+    def __init__(self):
+        self._model = None
+        self._state = ModelState.NOT_LOADED
+        self._error = None
+        self._lock = threading.Lock()
+        self._load_thread = None
+        self._model_path = "google/flan-t5-small"  # Default model
+        self._last_status_check = None
+        self._last_input = None
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Get the current status of the AI model"""
+        # Track when we last logged a status check to reduce log spam
+        old_state = self._state
+        
+        # Store status result
+        status = {
+            "state": self._state,
+            "model": self._model_path if self._model else None,
+            "error": str(self._error) if self._error else None,
+            "loading_started": self._load_thread is not None and self._load_thread.is_alive()
+        }
+        
+        # Only log status checks if it's been more than 30 seconds since last log
+        # or if there's an error or state change
+        current_time = time.time()
+        should_log = (
+            self._last_status_check is None or
+            (current_time - self._last_status_check) > 30 or
+            self._state == ModelState.ERROR or
+            old_state != self._state
+        )
+        
+        if should_log:
+            logger.debug(f"Model status check: {status}")
+            self._last_status_check = current_time
+            
+        return status
+    
+    def start_loading(self) -> None:
+        """
+        Begin loading the model in a background thread if not already loading
+        """
+        with self._lock:
+            if self._state == ModelState.LOADING:
+                # Already loading
+                return
+                
+            if self._state == ModelState.READY:
+                # Already loaded
+                return
+                
+            # Start loading in background thread
+            self._state = ModelState.LOADING
+            self._error = None
+            self._load_thread = threading.Thread(target=self._load_model)
+            self._load_thread.daemon = True
+            self._load_thread.start()
+    
+    def _load_model(self) -> None:
+        """Internal method to load the model"""
+        try:
+            logger.info(f"Loading model {self._model_path}...")
+            start_time = time.time()
+            
+            # Load the model
+            self._model = pipeline(
+                "text2text-generation",
+                model=self._model_path,
+                tokenizer=self._model_path,
+                device=-1  # Use CPU
+            )
+            
+            # Update state
+            with self._lock:
+                self._state = ModelState.READY
+                
+            elapsed = time.time() - start_time
+            logger.info(f"Model loaded successfully in {elapsed:.2f} seconds")
+            
+        except Exception as e:
+            # Handle errors
+            logger.error(f"Error loading model: {e}")
+            with self._lock:
+                self._state = ModelState.ERROR
+                self._error = e
+    
+    def process_text(self, text: str, options: Dict[str, Any] = None) -> Dict[str, Any]:
+        """
+        Process text input with fallback mechanisms
+        
+        Args:
+            text: The input text to process
+            options: Processing options (lang, forceJson, etc.)
+            
+        Returns:
+            Dictionary with processing results and metadata
+        """
+        options = options or {}
+        force_json = options.get("forceJson", True)
+        
+        # Store the input text for potential fallback
+        self._last_input = text
+        
+        # Check if text is just a greeting
+        if is_greeting(text):
+            logger.info("Input is just a greeting, returning empty task list")
+            return {
+                "tasks": [],
+                "method": "greeting_only",
+                "model_state": self._state,
+                "message": "Input contains only greeting, no tasks extracted"
+            }
+        
+        # If model not ready, use fallback extractor
+        if self._state != ModelState.READY:
+            # Use regex-based extractor as fallback
+            logger.info("Model not ready, using fallback extractor")
+            tasks = extract_tasks(text)
+            
+            # Process tasks to normalize dates
+            normalized_tasks = self._normalize_task_dates(tasks)
+            
+            return {
+                "tasks": normalized_tasks,
+                "method": "regex_fallback",
+                "model_state": self._state,
+                "message": "Using regex fallback because AI model is not ready"
+            }
+        
+        # Try AI model processing
+        try:
+            # Build the prompt for task extraction
+            prompt = self._build_prompt(text)
+            
+            # Generate with model - only use max_new_tokens (not max_length)
+            output = self._model(prompt, max_new_tokens=256, temperature=0.1, do_sample=False)
+            content = output[0]["generated_text"] if isinstance(output, list) else str(output)
+            logger.debug(f"Model generated text: {content}")
+            
+            # Parse and normalize the results
+            parsed_tasks = self._parse_model_output(content, force_json)
+            
+            # Normalize dates in tasks
+            normalized_tasks = self._normalize_task_dates(parsed_tasks)
+            
+            # If AI model returned no tasks, fall back to regex extractor
+            if not normalized_tasks:
+                logger.warning("AI model returned no tasks, trying fallback extraction")
+                tasks = extract_tasks(text)
+                normalized_tasks = self._normalize_task_dates(tasks)
+                
+                # Only use fallback if it found something
+                if normalized_tasks:
+                    return {
+                        "tasks": normalized_tasks,
+                        "method": "regex_fallback_after_ai_empty",
+                        "model_state": self._state,
+                        "message": "Used regex fallback after AI model returned no tasks"
+                    }
+            
+            return {
+                "tasks": normalized_tasks,
+                "method": "ai_model",
+                "model_state": self._state,
+                "message": "Successfully processed with AI model"
+            }
+        except Exception as e:
+            # If AI processing fails, fall back to regex extractor
+            logger.error(f"Error during AI processing: {e}")
+            tasks = extract_tasks(text)
+            normalized_tasks = self._normalize_task_dates(tasks)
+            
+            return {
+                "tasks": normalized_tasks,
+                "method": "regex_fallback_after_error",
+                "model_state": self._state,
+                "error": str(e),
+                "message": "Used regex fallback after AI model error"
+            }
+    
+    def _build_prompt(self, text: str) -> str:
+        """Build an improved prompt for task extraction with better date understanding"""
+        return (
+            "You are an expert task extraction engine. Read the INPUT and produce a JSON array of tasks.\n"
+            "Rules:\n"
+            "- The language may be Romanian or English. You must understand both.\n"
+            "- Output ONLY valid JSON (no markdown, no explanation).\n"
+            "- Each item has keys exactly: task, time, category, deadline.\n"
+            "- Use null for unknown fields.\n"
+            "- Ignore greetings, filler, random characters, or single letters.\n"
+            "- Do not split words into letters.\n"
+            "- If there are no tasks, return [].\n"
+            "- Normalize relative dates: 'tomorrow' should be the actual date (e.g., '2023-05-21').\n"
+            "\nCategories should be one of: Work, Personal, Family, Health, Shopping, Study, Finance, Travel, Home, Other\n"
+            "\nExamples:\n"
+            "English example: \"I need to buy milk at 5pm\"\n"
+            "JSON: [{\"task\":\"buy milk\",\"time\":\"5pm\",\"category\":\"Shopping\",\"deadline\":null}]\n"
+            "\nRomanian example: \"trebuie sa merg maine la piata\"\n"
+            "JSON: [{\"task\":\"merg la piata\",\"time\":null,\"category\":\"Shopping\",\"deadline\":\"maine\"}]\n"
+            "\nRomanian example: \"du copilul la scoala dimineata\"\n"
+            "JSON: [{\"task\":\"du copilul la scoala\",\"time\":\"dimineata\",\"category\":\"Family\",\"deadline\":null}]\n"
+            "\nRomanian example: \"plata facturi pana vineri\"\n"
+            "JSON: [{\"task\":\"plata facturi\",\"time\":null,\"category\":\"Finance\",\"deadline\":\"vineri\"}]\n"
+            "\nEnglish example: \"Hello! I need to buy milk tomorrow and call John on Friday\"\n"
+            "JSON: [{\"task\":\"buy milk\",\"time\":null,\"category\":\"Shopping\",\"deadline\":\"tomorrow\"}, {\"task\":\"call John\",\"time\":null,\"category\":\"Personal\",\"deadline\":\"Friday\"}]\n"
+            f"\nINPUT: {text}\n\n"
+            "JSON:"
+        )
+    
+    def _parse_model_output(self, output: str, force_json: bool = True) -> List[Dict[str, Any]]:
+        """Parse and normalize model output"""
+        # Try to extract JSON from the output
+        # Look for array pattern first
+        json_pattern = r"(\[.*?\])"
+        try:
+            # First attempt: try to find and parse JSON array
+            match = re.search(json_pattern, output, re.DOTALL)
+            if match:
+                try:
+                    data = json.loads(match.group(1))
+                    return self._normalize_tasks(data)
+                except json.JSONDecodeError:
+                    logger.warning("Found array pattern but couldn't parse as JSON")
+                
+            # Second attempt: try parsing the whole output as JSON
+            try:
+                data = json.loads(output)
+                if isinstance(data, list):
+                    return self._normalize_tasks(data)
+            except json.JSONDecodeError:
+                logger.warning("Couldn't parse whole output as JSON")
+                
+            # Third attempt: if JSON parsing failed, try fixing common issues
+            cleaned_output = re.sub(r"```json|```|\n", "", output).strip()
+            if cleaned_output.startswith("[") and cleaned_output.endswith("]"):
+                try:
+                    # Replace single quotes with double quotes
+                    cleaned_output = cleaned_output.replace("'", '"')
+                    # Remove trailing commas
+                    cleaned_output = re.sub(r',(\s*[\]}])', r'\1', cleaned_output)
+                    
+                    data = json.loads(cleaned_output)
+                    return self._normalize_tasks(data)
+                except json.JSONDecodeError:
+                    logger.warning("Couldn't parse cleaned output as JSON")
+                
+        except Exception as e:
+            logger.warning(f"Failed to parse JSON from model output: {e}")
+            
+            # Try more aggressive extraction - look for anything that could be a JSON array
+            try:
+                # Find the first [ and last ] in the string
+                start = output.find("[")
+                end = output.rfind("]") + 1
+                
+                if start >= 0 and end > start:
+                    potential_json = output[start:end]
+                    # Replace single quotes with double quotes
+                    potential_json = potential_json.replace("'", '"')
+                    # Remove trailing commas
+                    potential_json = re.sub(r',(\s*[\]}])', r'\1', potential_json)
+                    
+                    data = json.loads(potential_json)
+                    return self._normalize_tasks(data)
+            except (json.JSONDecodeError, IndexError) as e:
+                logger.warning(f"Failed aggressive JSON extraction: {e}")
+                
+        # If all parsing attempts fail and force_json is True, use fallback extractor
+        if force_json:
+            logger.warning("All JSON parsing attempts failed, using regex fallback")
+            return extract_tasks(output)
+            
+        return []
+        
+    def _normalize_tasks(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Normalize task data for consistent output"""
+        tasks = []
+        
+        if not isinstance(data, list):
+            return tasks
+            
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+                
+            task_text = str(item.get("task", "")).strip()
+            
+            # Skip if task is empty or too short
+            if not task_text or len(task_text) < 3:
+                continue
+                
+            # Skip if task is a single letter or common greeting
+            if re.fullmatch(r"[A-Za-z]", task_text) or is_greeting(task_text):
+                continue
+                
+            # Detect and fix corrupted task text that might contain JSON or be too long
+            if len(task_text) > 100 or task_text.count(':') > 3 or task_text.count('"') > 3:
+                logger.warning(f"Detected potentially corrupted task text: {task_text[:50]}...")
+                
+                # If it looks like it contains JSON, try to extract the actual task
+                if '[' in task_text and ']' in task_text or '{' in task_text and '}' in task_text:
+                    try:
+                        # Try to find the actual task content if it's embedded in JSON
+                        match = re.search(r'"task"\s*:\s*"([^"]+)"', task_text)
+                        if match:
+                            clean_text = match.group(1).strip()
+                            logger.info(f"Extracted clean task from corrupted text: {clean_text}")
+                            task_text = clean_text
+                        else:
+                            # Just take the first 50 chars if it's too long
+                            task_text = task_text[:50].strip() + "..."
+                    except Exception as e:
+                        logger.warning(f"Failed to clean corrupted task text: {e}")
+                        task_text = task_text[:50].strip() + "..."
+                else:
+                    # Just truncate if it's very long but not JSON
+                    task_text = task_text[:50].strip() + "..."
+                
+            # Normalize categories
+            category = item.get("category")
+            if isinstance(category, str) and category.strip():
+                # Map category to standard categories
+                category = category.strip().lower()
+                if category in {"work", "job", "business", "office", "munca", "serviciu", "birou", "profesional"}:
+                    category = "Work"
+                elif category in {"personal", "private", "individual", "propriu"}:
+                    category = "Personal"
+                elif category in {"family", "familie", "kids", "copii", "parinti", "parents", "children"}:
+                    category = "Family"
+                elif category in {"health", "sanatate", "medical", "doctor", "fitness", "gym", "sport", "exercise"}:
+                    category = "Health"
+                elif category in {"shopping", "cumparaturi", "store", "magazin", "buy", "purchase"}:
+                    category = "Shopping"
+                elif category in {"study", "studiu", "learn", "education", "school", "scoala", "homework", "teme"}:
+                    category = "Study"
+                elif category in {"finance", "financial", "money", "banking", "bills", "facturi", "plati", "payments"}:
+                    category = "Finance"
+                elif category in {"travel", "vacation", "trip", "journey", "calatorii", "vacanta", "excursie"}:
+                    category = "Travel"
+                elif category in {"home", "house", "casa", "acasa", "household", "cleaning", "curatenie"}:
+                    category = "Home"
+                else:
+                    category = "Other"
+            else:
+                category = None
+                
+            # Add the normalized task
+            tasks.append({
+                "task": task_text,
+                "time": item.get("time") or None,
+                "category": category,
+                "deadline": item.get("deadline") or None
+            })
+        
+        return tasks
+
+    def _normalize_task_dates(self, tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Normalize relative dates in tasks to actual calendar dates
+        """
+        normalized_tasks = []
+        
+        for task in tasks:
+            # Create a copy of the task to avoid modifying the original
+            normalized_task = task.copy()
+            
+            # Normalize deadline if it exists
+            if task.get("deadline"):
+                normalized_task["deadline"] = normalize_date(task["deadline"])
+                
+            normalized_tasks.append(normalized_task)
+            
+        return normalized_tasks
+
+# Create a global instance of the service
+model_service = AIModelService()
+
+# Start loading the model when the module is imported
+model_service.start_loading()
